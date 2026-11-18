@@ -755,6 +755,8 @@ interface SidebarProps {
   canCreate: boolean;
   onSelectProject: (project: Project) => void;
   onSelectSession: (session: SessionSummary) => void;
+  /** Warm a retired session before the click that needs it. */
+  onPrefetchSession?: (session: SessionSummary) => void;
   onNewSession: (projectId: string) => void;
   onNewProject: () => void;
   onRename: (session: SessionSummary) => void;
@@ -782,6 +784,7 @@ export function ProjectSidebar({
   canCreate,
   onSelectProject,
   onSelectSession,
+  onPrefetchSession,
   onNewSession,
   onNewProject,
   onRename,
@@ -793,6 +796,26 @@ export function ProjectSidebar({
   onMetadata,
 }: SidebarProps) {
   const zh = language === "zh";
+  // One dwell timer suffices: only the row under the pointer can schedule a
+  // warm, and leaving it cancels before any native host starts.
+  const prefetchTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (prefetchTimer.current !== null) window.clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = null;
+  }, []);
+  function schedulePrefetch(session: SessionSummary) {
+    if (!onPrefetchSession) return;
+    if (prefetchTimer.current !== null) window.clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = window.setTimeout(() => {
+      prefetchTimer.current = null;
+      onPrefetchSession(session);
+    }, 200);
+  }
+  function cancelPrefetch() {
+    if (prefetchTimer.current === null) return;
+    window.clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = null;
+  }
   const [archived, setArchived] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
     try {
@@ -901,6 +924,9 @@ export function ProjectSidebar({
       <div
         className={`project-session ${session.sessionId === sessionId ? "active" : ""}`}
         key={session.sessionId}
+        onPointerEnter={() => schedulePrefetch(session)}
+        onPointerLeave={cancelPrefetch}
+        onPointerDown={cancelPrefetch}
         onContextMenu={(event) => {
           if (!canManage && !canFork) return;
           event.preventDefault();

@@ -312,6 +312,13 @@ const LOCAL_SLASH_COMMANDS = new Set(["/help", "/tools"]);
  */
 const MAX_REARMS = 3;
 
+/**
+ * How long a hover-warmed session is left alone before the sidebar may warm it
+ * again. Idle retirement is measured in minutes, so a fresh cooldown per dwell
+ * would restart the same host on every pass.
+ */
+const PREFETCH_COOLDOWN_MS = 5 * 60 * 1000;
+
 const FAST_SNAPSHOT_OPTIONS = {
   limit: 40,
   includeHistory: false,
@@ -716,6 +723,12 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
+  /**
+   * Last warm request per session. `open` is idempotent for a live host, but a
+   * retired one costs a native process start, so a cooldown keeps repeated
+   * pointer passes over the sidebar from restarting the same host.
+   */
+  const prefetchedAt = useRef(new Map<string, number>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toolNameMode, setToolNameMode] = useState<ToolNameMode>(() => {
     try {
@@ -3722,6 +3735,34 @@ export default function App() {
     select(session.sessionId, session.projectId);
   }
 
+  /**
+   * Warm a retired session before the click that needs it.
+   *
+   * Restoring a historical session means starting a native host, which costs
+   * far more than the transcript read that follows it. Pointer dwell on the row
+   * pays that start while the user is still deciding. Best-effort only: a
+   * failure leaves the row selectable and the ordinary open path untouched.
+   */
+  function prefetchSession(session: SessionSummary) {
+    const id = session.sessionId;
+    if (!id || id === activeSessionRef.current) return;
+    if (sessionSelectionError(session)) return;
+    // A live host answers `open` in milliseconds, so warming buys nothing.
+    if (!["offline", "closed"].includes(session.status)) return;
+    const now = Date.now();
+    if (now - (prefetchedAt.current.get(id) ?? 0) < PREFETCH_COOLDOWN_MS) return;
+    prefetchedAt.current.set(id, now);
+    void api.openSession(id).then(
+      () => {
+        void refreshSessions();
+      },
+      () => {
+        // Let the next dwell retry instead of caching a failure for minutes.
+        prefetchedAt.current.delete(id);
+      },
+    );
+  }
+
   function retirementBusy(session: SessionSummary) {
     const state = session.sessionId === activeSessionRef.current ? status : session.status;
     if (!["running", "starting", "awaiting_input"].includes(state)) return false;
@@ -4650,6 +4691,7 @@ export default function App() {
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
               onSelectSession={selectSidebarSession}
+              onPrefetchSession={prefetchSession}
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
