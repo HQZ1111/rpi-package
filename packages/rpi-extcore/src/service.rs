@@ -15,13 +15,15 @@ pub use tool_program_queries::{
 pub use tool_program_snapshot::{
     child_snapshot, child_snapshot_for_host, ChildSnapshot, ChildSnapshotQuery,
 };
+#[cfg(test)]
+mod open_tests;
 mod resources;
 mod retirement;
 #[cfg(test)]
 #[path = "service_retirement_tests.rs"]
 mod service_retirement_tests;
 use crate::{
-    host::HostSession,
+    host::{HostSession, HostSnapshot},
     projects::Projects,
     protocol::{self, ApiCommand},
     registry::{Registry, RegistryEntry},
@@ -952,7 +954,68 @@ pub async fn open_session(state: &Service, id: String) -> (ReplyKind, Value) {
             )
         })
 }
+/// Admission checks shared by every open, live host or not: a latched storage
+/// failure, a deleting/archived entry, or a blocked resource record must never
+/// be reported as an open success.
+async fn open_admission(state: &Service, id: &str) -> Result<(), (ReplyKind, Value)> {
+    state.check_session_admission(id).await?;
+    state
+        .check_resource_storage(id)
+        .map_err(resources::reply_error)?;
+    if let Some(record) = state.registry.read().await.resource_configuration(id) {
+        if record.blocked() {
+            return Err((
+                ReplyKind::Conflict,
+                json!({"error":"resource operation pending or blocked; retry the same operation explicitly"}),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reply for a running host, or `None` when the session still has to be
+/// restored. Reading the live map needs no lifecycle lock.
+async fn live_open_reply(state: &Service, id: &str) -> Option<(ReplyKind, Value)> {
+    if state.closing.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let session = state.sessions.read().await.get(id).cloned()?;
+    if let Err(error) = open_admission(state, id).await {
+        return Some(error);
+    }
+    let snapshot = session.snapshot().await;
+    if snapshot.status == "closed" {
+        return None;
+    }
+    Some(opened_reply(state, id, snapshot).await)
+}
+
+/// Fields reported for every successful open, so the warm path and the locked
+/// lifecycle path cannot drift apart.
+async fn opened_reply(state: &Service, id: &str, snapshot: HostSnapshot) -> (ReplyKind, Value) {
+    state.touch_session(id).await;
+    let entry = state.registry.read().await.get(id).cloned();
+    (
+        ReplyKind::Success,
+        json!({
+            "sessionId": id,
+            "status": snapshot.status,
+            "title": entry.as_ref().and_then(|entry|entry.title.clone()).or(snapshot.title),
+            "createdAt": entry.as_ref().map(|entry|entry.created_at).unwrap_or(snapshot.created_at),
+            "updatedAt": snapshot.updated_at,
+            "lastSeq": snapshot.last_seq,
+            "ready": snapshot.ready,
+        }),
+    )
+}
+
 async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
+    // A live host needs no lifecycle decision, and answering it here keeps a
+    // warm open (a hover warm, a second tab) from queueing behind an unrelated
+    // native start, which the global lock holds for seconds.
+    if let Some(reply) = live_open_reply(state, &id).await {
+        return reply;
+    }
     // Concurrent tabs must not spawn two native writers for the same transcript.
     let _lifecycle = state.session_lifecycle.lock().await;
     if state.closing.load(std::sync::atomic::Ordering::Acquire) {
@@ -961,38 +1024,14 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
             json!({"error":"service shutting down"}),
         );
     }
-    if let Err(error) = state.check_session_admission(&id).await {
+    if let Err(error) = open_admission(state, &id).await {
         return error;
-    }
-    if let Err(error) = state.check_resource_storage(&id) {
-        return resources::reply_error(error);
-    }
-    if let Some(record) = state.registry.read().await.resource_configuration(&id) {
-        if record.blocked() {
-            return (
-                ReplyKind::Conflict,
-                json!({"error":"resource operation pending or blocked; retry the same operation explicitly"}),
-            );
-        }
     }
     let existing = state.sessions.read().await.get(&id).cloned();
     if let Some(session) = existing {
         let snapshot = session.snapshot().await;
         if snapshot.status != "closed" {
-            state.touch_session(&id).await;
-            let entry = state.registry.read().await.get(&id).cloned();
-            return (
-                ReplyKind::Success,
-                json!({
-                    "sessionId": id,
-                    "status": snapshot.status,
-                    "title": entry.as_ref().and_then(|entry|entry.title.clone()).or(snapshot.title),
-                    "createdAt": entry.as_ref().map(|entry|entry.created_at).unwrap_or(snapshot.created_at),
-                    "updatedAt": snapshot.updated_at,
-                    "lastSeq": snapshot.last_seq,
-                    "ready": snapshot.ready,
-                }),
-            );
+            return opened_reply(state, &id, snapshot).await;
         }
         // The native child exited (crash, kill, or `stop`); drop the corpse so
         // the branch can be reopened from its persisted session file.
