@@ -133,6 +133,26 @@ fn start(args: StartArgs) -> String {
     }
 }
 
+/// `_verify-start` payload: a JSON array of `{content,status}` items, or the
+/// older `{"items":[…]}` envelope. Both shapes are in the wild (host builds).
+fn parse_verify_items(rest: &str) -> Result<Vec<state::GoalItem>, String> {
+    let value: Value = serde_json::from_str(rest)
+        .map_err(|error| format!("_verify-start expects a JSON array of items: {error}"))?;
+    let items = match value {
+        Value::Array(_) => value,
+        Value::Object(mut object) => object
+            .remove("items")
+            .ok_or("_verify-start object payload must carry an `items` array")?,
+        other => {
+            return Err(format!(
+                "_verify-start expects an array or an object, got {other}"
+            ))
+        }
+    };
+    serde_json::from_value(items)
+        .map_err(|error| format!("_verify-start item shape is invalid: {error}"))
+}
+
 /// Route one `/goal` invocation. Returns the text the TUI renders.
 pub fn run(args: &str) -> String {
     let args = args.trim();
@@ -173,13 +193,10 @@ pub fn run(args: &str) -> String {
             ops::set_verification_armed(armed)
                 .map(|armed| format!("🔒 Completion verification armed: {armed}"))
         }
-        "_verify-start" => match serde_json::from_str::<Vec<state::GoalItem>>(rest) {
-            Ok(items) => ops::verify_start(items).map(|goal| {
-                let iteration = goal.verify_iteration.unwrap_or(0);
-                format!("🔎 Verifying: {} (iteration {iteration})", goal.title)
-            }),
-            Err(error) => Err(format!("_verify-start expects a JSON array of items: {error}")),
-        },
+        "_verify-start" => parse_verify_items(rest).and_then(ops::verify_start).map(|goal| {
+            let iteration = goal.verify_iteration.unwrap_or(0);
+            format!("🔎 Verifying: {} (iteration {iteration})", goal.title)
+        }),
         "_verify-result" => {
             let payload: Value = match serde_json::from_str(rest) {
                 Ok(payload) => payload,
@@ -333,5 +350,18 @@ mod tests {
         assert!(run("_verify-start not-json").contains("expects a JSON array"));
         assert!(run("_verify-result nope").contains("expects a JSON object"));
         assert!(run("_verify-result {\"outcome\":\"bogus\"}").contains("outcome must be"));
+    }
+
+    #[test]
+    fn verify_start_accepts_the_array_and_the_items_envelope() {
+        assert_eq!(
+            parse_verify_items(r#"[{"content":"a","status":"pending"}]"#)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(parse_verify_items(r#"{"items":[]}"#).unwrap().len(), 0);
+        assert!(parse_verify_items("{}").is_err());
+        assert!(parse_verify_items("[1]").is_err());
     }
 }
