@@ -263,6 +263,50 @@ fn a_missed_boundary_recovers_instead_of_stalling() {
 }
 
 #[test]
+fn armed_goals_never_recover_or_inject_into_a_live_run() {
+    let _guard = support::serial();
+    support::install();
+    support::fire(EventTag::SessionStart);
+    support::settle_pause();
+    support::command("_verify-enable on");
+
+    // The host missed the boundary and the grace is already expired, but a run
+    // is still in flight (a queued `SendMessage` can return before its run
+    // finishes). No continuation and no "missed the boundary" notice may fire
+    // mid-run; the armed settle waits for the verdict instead.
+    let stale = rpi_goal::state::now_ms() - rpi_goal::state::VERIFICATION_ARM_GRACE_MS - 1_000;
+    support::set_goal(armed_state("active", false, stale));
+    support::fire(EventTag::AgentStart);
+    support::fire(EventTag::SessionStart); // wake the worker mid-run
+    support::sleep(200);
+    assert_eq!(
+        support::sends_mentioning("Manual objective").len(),
+        0,
+        "an armed goal must not inject into a live run"
+    );
+    let mid_run_notice = support::calls_named("AppendEntry")
+        .into_iter()
+        .filter_map(|call| call["message"].clone().as_object().cloned())
+        .any(|message| {
+            message
+                .get("content")
+                .and_then(|content| content[0].get("text"))
+                .and_then(|text| text.as_str())
+                .map(|text| text.contains("did not open a boundary"))
+                .unwrap_or(false)
+        });
+    assert!(!mid_run_notice, "the grace recovery must not fire mid-run");
+
+    support::fire(EventTag::AgentEnd);
+    support::sleep(200);
+    assert_eq!(
+        support::sends_mentioning("Manual objective").len(),
+        0,
+        "the settled armed goal waits for the host verdict"
+    );
+}
+
+#[test]
 fn deferred_host_commits_still_show_the_verdict() {
     let _guard = support::serial();
     arm();

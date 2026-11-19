@@ -273,6 +273,13 @@ fn evaluate(goals: Goals, settings: settings::Settings, tools_available: bool) -
         );
     }
 
+    // Never inject into a live run: wait for its settled boundary. This must
+    // come first — a queued `SendMessage` can return before its run finishes,
+    // and an armed host must not start a grace timer (or inject) mid-run.
+    if crate::events::is_run_active() {
+        return Plan::Idle;
+    }
+
     // Armed completion verification: the host decides whether the run that just
     // settled is done. Withhold the continuation until `_verify-start` /
     // `_verify-result` arrive; if the host never opens the boundary, continue
@@ -301,11 +308,6 @@ fn evaluate(goals: Goals, settings: settings::Settings, tools_available: bool) -
         }
         // This dispatch pays the debt: the next settled run is verified again.
         goal.pending_dispatch = false;
-    }
-
-    // Never inject into a live run: wait for its settled boundary.
-    if crate::events::is_run_active() {
-        return Plan::Idle;
     }
 
     goal.waiting = None;
